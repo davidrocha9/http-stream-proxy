@@ -1,0 +1,7 @@
+{
+  // Upstream M3U URL for IPTV playlist
+  "upstream_m3u_url": "http://<your-provider-url>",
+
+  // Port for this proxy server
+  "port": 2727
+}
