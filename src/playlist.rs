@@ -1,8 +1,10 @@
 use crate::state::{AppConfig, AppState};
+use crate::sync::SyncState;
 use bytes::Bytes;
 use dashmap::DashMap;
 use m3u_parser::M3uParser;
 use std::{io::Error, sync::Arc};
+use tokio::sync::{broadcast, RwLock};
 use urlencoding::encode;
 
 // Sadly the m3u_parser crate swallows parsing errors completely
@@ -10,44 +12,59 @@ use urlencoding::encode;
 pub async fn load_playlist() -> AppState {
     let config = AppConfig::load().expect("failed to load Config");
     let url = config.clone().upstream_m3u_url;
-    let app_state = AppState {
-        config,
-        channels: DashMap::new(),
-        streams: Arc::new(DashMap::new()),
-        client: reqwest::Client::new(),
-    };
+    
+    // Create sync broadcast channel (capacity 16 is enough for state updates)
+    let (sync_tx, _) = broadcast::channel::<SyncState>(16);
+    
+    let channels: DashMap<String, m3u_parser::Info> = DashMap::new();
+    let mut channel_order: Vec<String> = Vec::new();
 
     let mut playlist = M3uParser::new(None);
     playlist.parse_m3u(&url, false, false).await;
-    playlist.get_vector().iter().for_each(|m| {
-        // Add stream_info to AppState
-        app_state.channels.insert(m.title.clone(), m.clone());
-    });
+    for m in playlist.get_vector().iter() {
+        channels.insert(m.title.clone(), m.clone());
+        channel_order.push(m.title.clone());
+    }
+
+    let app_state = AppState {
+        config,
+        channels,
+        channel_order: Arc::new(channel_order),
+        streams: Arc::new(DashMap::new()),
+        client: reqwest::Client::new(),
+        sync_state: Arc::new(RwLock::new(SyncState::default())),
+        sync_tx,
+    };
 
     app_state
 }
 
-pub fn deserialize_playlist(state: &AppState) -> Result<bytes::Bytes, Error> {
+pub fn deserialize_playlist(state: &AppState, host: &str) -> Result<bytes::Bytes, Error> {
     let mut out = String::with_capacity(state.channels.len() * 160);
     out.push_str("#EXTM3U\n");
 
-    for entry in state.channels.iter() {
+    // Iterate in original playlist order
+    for title in state.channel_order.iter() {
+        let Some(entry) = state.channels.get(title) else {
+            continue;
+        };
         let info = entry.value();
 
         // EXTINF line
         out.push_str("#EXTINF:-1 ");
 
         out.push_str(&format!(
-            r#"tvg-id="{}" tvg-name="{}" tvg-logo="{}" group-title="{}","{}""#,
+            r#"tvg-id="{}" tvg-name="{}" tvg-logo="{}" group-title="{}",{}"#,
             info.tvg.id, info.tvg.name, info.logo, info.category, info.title,
         ));
 
         out.push('\n');
 
-        // Proxied URL
+        // Proxied URL - use the requesting host so it works via Tailscale or any hostname
+        // The host header already includes the port if non-standard
         let proxied_url = format!(
-            "http://localhost:{}/channel/{}",
-            state.config.port,
+            "http://{}/channel/{}",
+            host,
             encode(&info.title)
         );
 
