@@ -1,18 +1,22 @@
 use axum::{
+    Json,
     extract::{Query, State},
     http::StatusCode,
     response::{
-        sse::{Event, KeepAlive, Sse},
         IntoResponse,
+        sse::{Event, KeepAlive, Sse},
     },
-    Json,
 };
 use futures_util::stream::Stream;
 use serde::{Deserialize, Serialize};
 use std::{convert::Infallible, time::Duration};
-use tokio_stream::{wrappers::BroadcastStream, StreamExt};
+use tokio_stream::{StreamExt, wrappers::BroadcastStream};
 
 use crate::state::AppState;
+
+// ============================================================================
+// Data Types
+// ============================================================================
 
 /// Sync state shared across all clients
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -49,6 +53,73 @@ pub struct SyncDeleteQuery {
     pub client_id: Option<String>,
 }
 
+// ============================================================================
+// Core Sync Logic (reusable across handlers)
+// ============================================================================
+
+/// Check if the given channel URL differs from the current active channel
+pub async fn is_channel_change(state: &AppState, channel_url: &str) -> bool {
+    let current = state.sync_state.read().await;
+    match &current.active_channel_url {
+        Some(current_url) => current_url != channel_url,
+        None => true, // No active channel means any channel is a change
+    }
+}
+
+/// Update sync state and broadcast to all connected clients.
+/// Returns the new SyncState.
+pub async fn update_sync_state(
+    state: &AppState,
+    channel_url: Option<String>,
+    channel_name: Option<String>,
+    is_playing: Option<bool>,
+    client_id: &str,
+) -> SyncState {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+
+    let new_state = SyncState {
+        active_channel_url: channel_url.clone(),
+        active_channel_name: channel_name.clone(),
+        is_playing: is_playing.unwrap_or(channel_url.is_some()),
+        updated_at: now,
+        updated_by: client_id.to_string(),
+    };
+
+    tracing::info!(
+        client_id = %client_id,
+        channel_name = new_state.active_channel_name.as_deref().unwrap_or("stopped"),
+        channel_url = new_state.active_channel_url.as_deref().unwrap_or("none"),
+        is_playing = new_state.is_playing,
+        "sync state updated"
+    );
+
+    // Update shared state
+    {
+        let mut sync_state = state.sync_state.write().await;
+        *sync_state = new_state.clone();
+    }
+
+    // Broadcast to all connected clients
+    if let Err(e) = state.sync_tx.send(new_state.clone()) {
+        tracing::debug!("Broadcast send failed (no receivers): {}", e);
+    }
+
+    new_state
+}
+
+/// Clear sync state (stop playback) and broadcast to all connected clients.
+/// Returns the new SyncState.
+pub async fn clear_sync_state(state: &AppState, client_id: &str) -> SyncState {
+    update_sync_state(state, None, None, Some(false), client_id).await
+}
+
+// ============================================================================
+// API Handlers
+// ============================================================================
+
 /// SSE endpoint: GET /sync?clientId=...
 /// Returns a stream of sync state updates
 pub async fn sync_sse(
@@ -56,7 +127,7 @@ pub async fn sync_sse(
     State(state): State<AppState>,
 ) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
     let client_id = query.client_id.unwrap_or_else(|| "unknown".to_string());
-    println!("[Sync] Client connected: {}", client_id);
+    tracing::info!(client_id = %client_id, "SSE client connected");
 
     // Get current state to send immediately
     let current = state.sync_state.read().await.clone();
@@ -89,46 +160,27 @@ pub async fn sync_sse(
 }
 
 /// POST /sync - Update sync state and broadcast to all clients
+/// Also triggers prewarming if a new channel is selected
 pub async fn sync_update(
     State(state): State<AppState>,
     Json(payload): Json<SyncUpdateRequest>,
 ) -> impl IntoResponse {
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_millis() as u64;
-
-    let new_state = SyncState {
-        active_channel_url: payload.active_channel_url.clone(),
-        active_channel_name: payload.active_channel_name.clone(),
-        is_playing: payload.is_playing.unwrap_or(payload.active_channel_url.is_some()),
-        updated_at: now,
-        updated_by: payload.client_id.clone(),
-    };
-
-    println!(
-        "[Sync] Update from {}: {} ({})",
-        payload.client_id,
-        new_state.active_channel_name.as_deref().unwrap_or("stopped"),
-        new_state.active_channel_url.as_deref().unwrap_or("none")
-    );
-
-    // Trigger prewarm if we have a channel URL
-    if let Some(ref url) = new_state.active_channel_url {
+    // Trigger prewarm if we have a channel URL (before updating state)
+    if let Some(ref url) = payload.active_channel_url {
         // Extract channel title from URL (e.g., /channel/my-title -> my-title)
         if let Some(title) = extract_channel_title(url) {
             if let Some(channel_info) = state.channels.get(&title) {
                 let upstream_url = channel_info.url.clone();
-                
+
                 // Only prewarm if not already active
                 if !state.streams.contains_key(&upstream_url) {
-                    println!("[Sync] Triggering prewarm for: {}", title);
+                    tracing::info!(channel = %title, "triggering prewarm");
                     // Fire-and-forget prewarm in background
                     let state_clone = state.clone();
                     let title_clone = title.clone();
                     tokio::spawn(async move {
                         if let Err(e) = prewarm_internal(&state_clone, &title_clone).await {
-                            tracing::warn!("Prewarm failed for {}: {:?}", title_clone, e);
+                            tracing::warn!(channel = %title_clone, error = %e, "prewarm failed");
                         }
                     });
                 }
@@ -136,16 +188,15 @@ pub async fn sync_update(
         }
     }
 
-    // Update shared state
-    {
-        let mut sync_state = state.sync_state.write().await;
-        *sync_state = new_state.clone();
-    }
-
-    // Broadcast to all connected clients
-    if let Err(e) = state.sync_tx.send(new_state) {
-        tracing::debug!("Broadcast send failed (no receivers): {}", e);
-    }
+    // Update and broadcast using shared logic
+    update_sync_state(
+        &state,
+        payload.active_channel_url,
+        payload.active_channel_name,
+        payload.is_playing,
+        &payload.client_id,
+    )
+    .await;
 
     StatusCode::OK
 }
@@ -156,35 +207,18 @@ pub async fn sync_delete(
     State(state): State<AppState>,
 ) -> impl IntoResponse {
     let client_id = query.client_id.unwrap_or_else(|| "unknown".to_string());
-    
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_millis() as u64;
 
-    let new_state = SyncState {
-        active_channel_url: None,
-        active_channel_name: None,
-        is_playing: false,
-        updated_at: now,
-        updated_by: client_id.clone(),
-    };
+    tracing::info!(client_id = %client_id, "sync stop requested");
 
-    println!("[Sync] Stop from {}", client_id);
-
-    // Update shared state
-    {
-        let mut sync_state = state.sync_state.write().await;
-        *sync_state = new_state.clone();
-    }
-
-    // Broadcast to all connected clients
-    if let Err(e) = state.sync_tx.send(new_state) {
-        tracing::debug!("Broadcast send failed (no receivers): {}", e);
-    }
+    // Clear and broadcast using shared logic
+    clear_sync_state(&state, &client_id).await;
 
     StatusCode::OK
 }
+
+// ============================================================================
+// Internal Helpers
+// ============================================================================
 
 /// Extract channel title from a URL like "http://proxy:2727/channel/my-title"
 fn extract_channel_title(url: &str) -> Option<String> {
@@ -200,7 +234,6 @@ fn extract_channel_title(url: &str) -> Option<String> {
     None
 }
 
-/// Internal prewarm function (reused from api.rs logic)
 async fn prewarm_internal(state: &AppState, title: &str) -> Result<(), String> {
     let url = state
         .channels
@@ -220,7 +253,7 @@ async fn prewarm_internal(state: &AppState, title: &str) -> Result<(), String> {
     let title_owned = title.to_string();
 
     state.streams.insert(url.clone(), tx);
-    println!("[Prewarm/Sync] Starting connection to channel: {} at url: {}", title, url);
+    tracing::info!(channel = %title, upstream_url = %url, "prewarm starting upstream connection");
 
     let parsed_url = reqwest::Url::parse(&url).map_err(|e| e.to_string())?;
     let request = reqwest::Request::new(reqwest::Method::GET, parsed_url);
@@ -233,41 +266,49 @@ async fn prewarm_internal(state: &AppState, title: &str) -> Result<(), String> {
 
     let mut stream = futures_util::StreamExt::fuse(response.bytes_stream());
 
-    // Spawn background task to keep the stream warm
+    // Spawn background task to keep the stream warm until subscribers connect or timeout
     tokio::spawn(async move {
         let mut chunk_count = 0;
-        let prewarm_timeout = tokio::time::sleep(tokio::time::Duration::from_secs(30));
+        let prewarm_timeout = tokio::time::sleep(tokio::time::Duration::from_secs(10));
         tokio::pin!(prewarm_timeout);
 
         loop {
             tokio::select! {
                 _ = &mut prewarm_timeout => {
                     if tx_clone.receiver_count() == 0 {
-                        println!("[Prewarm/Sync] Timeout with no subscribers for {}, closing", title_owned);
+                        tracing::info!(channel = %title_owned, "prewarm timeout with no subscribers, closing");
                         break;
                     }
+                    // If we have subscribers, continue indefinitely (normal stream behavior)
                 }
                 chunk = tokio_stream::StreamExt::next(&mut stream) => {
                     match chunk {
                         Some(Ok(bytes)) => {
                             chunk_count += 1;
                             if chunk_count == 1 {
-                                println!("[Prewarm/Sync] First chunk received for {}", title_owned);
+                                tracing::debug!(channel = %title_owned, "prewarm first chunk received");
                             }
-                            
-                            if tx_clone.receiver_count() == 0 && chunk_count > 10 {
-                                break;
+
+                            // Once subscribers connect, check if they all disconnect
+                            if tx_clone.receiver_count() == 0 && chunk_count > 20 {
+                                // Only exit if we HAD subscribers and they all left
+                                // The timeout handles the "never had subscribers" case
+                                if prewarm_timeout.is_elapsed() {
+                                    tracing::debug!(channel = %title_owned, "no more subscribers, closing prewarm");
+                                    break;
+                                }
                             }
 
                             if let Err(e) = tx_clone.send(bytes) {
-                                tracing::debug!(error = %e, "broadcast send failed");
+                                tracing::trace!(error = %e, "prewarm broadcast send failed (no receivers)");
                             }
                         }
                         Some(Err(e)) => {
-                            tracing::warn!(error = %e, "upstream stream error during prewarm");
+                            tracing::warn!(channel = %title_owned, error = %e, "upstream stream error during prewarm");
                             break;
                         }
                         None => {
+                            tracing::debug!(channel = %title_owned, "upstream stream ended");
                             break;
                         }
                     }
@@ -275,6 +316,7 @@ async fn prewarm_internal(state: &AppState, title: &str) -> Result<(), String> {
             }
         }
 
+        tracing::debug!(channel = %title_owned, "prewarm connection closed");
         state_handle.remove(&url_clone);
     });
 

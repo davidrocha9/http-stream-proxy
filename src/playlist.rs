@@ -39,7 +39,7 @@ pub async fn load_playlist() -> AppState {
     app_state
 }
 
-pub fn deserialize_playlist(state: &AppState, host: &str) -> Result<bytes::Bytes, Error> {
+pub fn serialize_playlist(state: &AppState, host: &str) -> Result<bytes::Bytes, Error> {
     let mut out = String::with_capacity(state.channels.len() * 160);
     out.push_str("#EXTM3U\n");
 

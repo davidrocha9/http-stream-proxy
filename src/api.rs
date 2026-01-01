@@ -1,7 +1,7 @@
 use crate::error::{ProxyError, UpstreamFetchError};
-use crate::playlist::{deserialize_playlist, load_playlist};
+use crate::playlist::{serialize_playlist, load_playlist};
 use crate::state::AppState;
-use crate::sync::{sync_delete, sync_sse, sync_update};
+use crate::sync::{self, sync_delete, sync_sse, sync_update};
 use axum::{
     Json, Router,
     body::Body,
@@ -17,6 +17,7 @@ use serde::Serialize;
 use std::sync::Arc;
 use tokio::sync::broadcast;
 use tower_http::cors::CorsLayer;
+use urlencoding::encode;
 
 pub async fn serve() {
     let app_state = load_playlist().await;
@@ -59,7 +60,7 @@ async fn load(
         .map(|s| s.to_string())
         .unwrap_or_else(|| format!("localhost:{}", state.config.port));
 
-    let body = deserialize_playlist(&state, &host); // bytes::Bytes
+    let body = serialize_playlist(&state, &host); // bytes::Bytes
 
     Ok(Response::builder()
         .status(StatusCode::OK)
@@ -74,6 +75,7 @@ async fn load(
 
 async fn proxy(
     Path(title): Path<String>,
+    headers: HeaderMap,
     State(state): State<AppState>,
 ) -> Result<Response<Body>, ProxyError> {
     let url = state
@@ -84,6 +86,31 @@ async fn proxy(
         })?
         .url
         .clone();
+
+    // Build the channel URL for sync state (matches playlist format)
+    let host = headers
+        .get("host")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("localhost");
+    let channel_url = format!("http://{}/channel/{}", host, encode(&title));
+
+    // Broadcast sync state if this is a channel change
+    if sync::is_channel_change(&state, &channel_url).await {
+        let client_id = headers
+            .get("user-agent")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("unknown")
+            .to_string();
+
+        sync::update_sync_state(
+            &state,
+            Some(channel_url),
+            Some(title.clone()),
+            Some(true),
+            &client_id,
+        )
+        .await;
+    }
 
     let tx = match state.streams.get(&url) {
         Some(tx) => tx.clone(),
