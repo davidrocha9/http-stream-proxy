@@ -3,5 +3,10 @@
   "upstream_m3u_url": "http://<your-provider-url>",
 
   // Port for this proxy server
-  "port": 2727
+  "port": 2727,
+
+  // if set to production, middlewares authorize based on tailscale credentials
+  "env": "local",
+  "admin_email": "caionogueira0626@gmail.com",
+  "whitelisted_emails": [],
 }

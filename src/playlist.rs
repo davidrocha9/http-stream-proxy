@@ -72,3 +72,20 @@ pub fn serialize_playlist(state: &AppState, host: &str) -> Result<bytes::Bytes, 
 
     Ok(Bytes::from(out))
 }
+
+pub fn serialize_guest_playlist(host: &str) -> Result<bytes::Bytes, Error> {
+    let mut out = String::with_capacity(128);
+    out.push_str("#EXTM3U\n");
+    
+    // EXTINF line
+    out.push_str("#EXTINF:-1 ");
+    out.push_str(r#"tvg-id="live" tvg-name="live" tvg-logo="" group-title="Guest",live"#);
+    out.push('\n');
+    
+    // Guest URL
+    let guest_url = format!("http://{}/guest", host);
+    out.push_str(&guest_url);
+    out.push('\n');
+    
+    Ok(Bytes::from(out))
+}

@@ -8,7 +8,6 @@ use tokio_util::sync::CancellationToken;
 
 #[derive(Clone)]
 pub struct UpstreamManager {
-    // TODO(caio): maybe we don't need this
     pub stream_url: Arc<RwLock<Option<String>>>,
 
     /*

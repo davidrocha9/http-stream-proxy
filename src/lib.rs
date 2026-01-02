@@ -4,3 +4,4 @@ pub mod api;
 pub mod error;
 pub mod sync;
 pub mod proxy;
+pub mod auth;

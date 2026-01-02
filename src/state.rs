@@ -13,6 +13,10 @@ pub struct AppConfig {
     pub upstream_m3u_url: String,
     #[serde(default = "default_port")]
     pub port: u16,
+    pub admin_email: String,
+    pub whitelisted_emails: Vec<String>,
+    #[serde(default = "default_env")]
+    pub env: String,
 }
 
 impl AppConfig {
@@ -30,6 +34,10 @@ impl AppConfig {
 
 fn default_port() -> u16 {
     2727
+}
+
+fn default_env() -> String {
+    "local".to_string()
 }
 
 /*

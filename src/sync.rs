@@ -224,7 +224,7 @@ pub async fn sync_delete(
 // ============================================================================
 
 /// Extract channel title from a URL like "http://proxy:2727/channel/my-title"
-fn extract_channel_title(url: &str) -> Option<String> {
+pub fn extract_channel_title(url: &str) -> Option<String> {
     // Try to extract from /channel/{title} pattern
     if let Some(pos) = url.find("/channel/") {
         let rest = &url[pos + 9..]; // skip "/channel/"

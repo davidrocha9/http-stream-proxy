@@ -26,6 +26,9 @@ pub enum ProxyError {
         #[source]
         source: broadcast::error::SendError<Bytes>,
     },
+    
+    #[error("no active stream")]
+    GuestError
 }
 
 impl ProxyError {
@@ -35,6 +38,7 @@ impl ProxyError {
             ProxyError::UpstreamRequest { .. } => StatusCode::BAD_GATEWAY,
             ProxyError::UpstreamStream { .. } => StatusCode::BAD_GATEWAY,
             ProxyError::DownstreamSend { .. } => StatusCode::INTERNAL_SERVER_ERROR,
+            ProxyError::GuestError { .. } => StatusCode::NOT_FOUND,
         }
     }
 }

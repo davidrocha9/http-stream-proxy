@@ -984,6 +984,7 @@ dependencies = [
  "bytes",
  "config",
  "dashmap",
+ "futures",
  "futures-core",
  "futures-util",
  "m3u_parser",
