@@ -3,75 +3,168 @@ use crate::state::AppState;
 use bytes::Bytes;
 use futures_util::StreamExt;
 use std::sync::Arc;
-use tokio::sync::broadcast;
-use tokio::sync::broadcast::Sender;
+use tokio::sync::{RwLock, broadcast};
+use tokio_util::sync::CancellationToken;
 
-async fn spawn_upstream(state: &AppState, url: String) -> Result<Sender<Bytes>, ProxyError> {
-    let (tx, _) = broadcast::channel::<Bytes>(1024);
-    let tx_clone = tx.clone();
-    let state_handle = Arc::clone(&state.streams);
+#[derive(Clone)]
+pub struct UpstreamManager {
+    // TODO(caio): maybe we don't need this
+    pub stream_url: Arc<RwLock<Option<String>>>,
 
-    state.streams.insert(url.clone(), tx.clone());
-    tracing::info!("Starting connection to channel at url: {}", url);
-    let parsed_url = reqwest::Url::parse(&url).expect("failed to parse stream url");
-    let request = reqwest::Request::new(reqwest::Method::GET, parsed_url);
+    /*
+     * This is static throughout the application's lifetimne
+     * By keeping it static, consumers that subscribe to it will change streams
+     * seamlessly
+     */
+    pub sender: broadcast::Sender<Bytes>,
 
-    let response = state
-        .client
-        .execute(request)
-        .await
-        .map_err(|e| ProxyError::UpstreamRequest { source: e })?;
+    /*
+     * we can only have ONE concurrent upstream connection at any time
+     * so let's just have one single http client that can then easily be configured
+     * e.g.: timeouts, headers, retries, etc
+     */
+    pub client: reqwest::Client,
 
-    let mut stream = response.bytes_stream();
+    /*
+     * We lock the `run` method so that we're not interleaving upstream connections
+     */
+    lock: Arc<tokio::sync::Mutex<()>>,
 
-    tokio::spawn(async move {
-        while let Some(chunk) = stream.next().await {
-            // Check if there are active subscribers to the broadcast channel
-            if tx_clone.receiver_count() == 0 {
-                tracing::debug!("No more subscribers for {}, closing stream", url);
-                break;
-            }
+    // Cancellation token to signal the active upstream task to stop
+    // When switching channels, we cancel the old task before starting the new one
+    cancel_token: Arc<RwLock<CancellationToken>>,
+}
 
-            match chunk {
-                Ok(bytes) => {
-                    if let Err(e) = tx_clone.send(bytes) {
-                        // If send fails (no receivers), it's fine, we break on next loop via receiver_count check or here
-                        tracing::debug!(error = %e, "broadcast send failed (no receivers?)");
-                        // Actually send error usually means no receivers for broadcast?
-                        // Broadcast channel returns error only if closed.
-                        // But we hold a clone of tx, so it's not closed.
-                        // receiver_count() is the better check.
-                    }
-                }
-                Err(e) => {
-                    tracing::warn!(error = %e, "upstream stream error");
-                    break;
-                }
+impl UpstreamManager {
+    pub fn new(sender: broadcast::Sender<Bytes>) -> Self {
+        Self {
+            sender,
+            stream_url: Arc::new(RwLock::new(None)),
+            client: reqwest::Client::new(),
+            lock: Arc::new(tokio::sync::Mutex::new(())),
+            cancel_token: Arc::new(RwLock::new(CancellationToken::new())),
+        }
+    }
+
+    // Cancel any active upstream connection
+    async fn cancel_active(&self) {
+        let token = self.cancel_token.read().await;
+        token.cancel();
+    }
+
+    pub async fn run(&self, url: String, prewarm: bool) -> Result<(), ProxyError> {
+        let _guard = self.lock.lock().await;
+
+        // Check if we're already streaming this URL
+        if let Some(active) = self.stream_url.read().await.as_deref() {
+            if active == url {
+                return Ok(());
             }
         }
 
-        tracing::debug!("Closing connection to url: {}", url);
-        state_handle.remove(&url);
-    });
+        // Cancel any existing upstream connection before starting a new one
+        self.cancel_active().await;
 
-    Ok(tx)
+        // Create a new cancellation token for this connection
+        let new_token = CancellationToken::new();
+        let task_token = new_token.clone();
+        {
+            let mut token = self.cancel_token.write().await;
+            *token = new_token;
+        }
+
+        let tx_clone = self.sender.clone();
+        {
+            let mut stream_url = self.stream_url.write().await;
+            *stream_url = Some(url.clone());
+        }
+
+        tracing::info!("Starting connection to channel at url: {}", url);
+        let parsed_url = reqwest::Url::parse(&url).expect("failed to parse stream url");
+        let request = reqwest::Request::new(reqwest::Method::GET, parsed_url);
+
+        let response = self
+            .client
+            .execute(request)
+            .await
+            .map_err(|e| ProxyError::UpstreamRequest { source: e })?;
+
+        let stream = response.bytes_stream();
+        let upstream_clone = self.clone();
+        let mut chunk_cnt = 0;
+
+        tokio::spawn(async move {
+            // https://doc.rust-lang.org/std/pin/index.html#address-sensitive-values-aka-when-we-need-pinning:~:text=As%20a%20motivating,s.
+            // tokio::select! needs the stream to be pinned since it relies on the reference not changing in
+            // between poll_next() calls
+            tokio::pin!(stream);
+
+            loop {
+                tokio::select! {
+                    // Check for cancellation signal (channel switch)
+                    // We don't need it, but it's a good idea to control our invariants
+                    _ = task_token.cancelled() => {
+                        tracing::info!("Upstream connection cancelled (channel switch): {}", url);
+                        break;
+                    }
+                    chunk = stream.next() => {
+                        match chunk {
+                            Some(Ok(bytes)) => {
+                                chunk_cnt += 1;
+                                tracing::debug!("Received {} bytes from upstream, {} receivers",
+                                                    bytes.len(), tx_clone.receiver_count());
+
+                                /*
+                                 * usually we abort if the stream is closed
+                                 * if we're prewarming, we have a little grace period (wait for a few chunks to arrive)
+                                 * since the client needs a whole RTT to attach itself to the stream
+                                 */
+                                if tx_clone.receiver_count() == 0 || (prewarm && chunk_cnt <= 20) {
+                                    tracing::debug!("No more subscribers for {}, closing stream", url);
+                                    break;
+                                }
+
+                                if let Err(e) = tx_clone.send(bytes) {
+                                    tracing::debug!(error = %e, "broadcast send failed (no receivers?)");
+                                }
+                            }
+                            Some(Err(e)) => {
+                                tracing::warn!(error = %e, "upstream stream error");
+                                break;
+                            }
+                            None => {
+                                tracing::debug!("Upstream stream ended: {}", url);
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Only clear stream_url if we weren't cancelled (i.e., stream ended naturally)
+            // If cancelled, the new connection will set its own URL
+            if !task_token.is_cancelled() {
+                let mut stream_url = upstream_clone.stream_url.write().await;
+                *stream_url = None;
+            }
+
+            tracing::debug!("Closing connection to url: {}", url);
+        });
+
+        Ok(())
+    }
 }
 
 pub async fn attach_to_stream(
     state: &AppState,
-    url: String,
+    url: &str,
 ) -> Result<
     impl tokio_stream::Stream<Item = Result<Bytes, std::io::Error>> + Send + 'static,
     ProxyError,
 > {
-    let tx = match state.streams.get(url.as_str()) {
-        Some(tx) => tx.clone(),
-        None => spawn_upstream(state, url)
-            .await
-            .expect("spawn_upstream failed"),
-    };
-
-    let rx = tx.subscribe();
+    tracing::debug!("Attaching to stream at url {}", url);
+    state.upstream_manager.run(url.to_string(), false).await?;
+    let rx = state.upstream_manager.sender.clone().subscribe();
 
     let stream = async_stream::stream! {
         let mut rx_stream = tokio_stream::wrappers::BroadcastStream::new(rx);
@@ -87,7 +180,12 @@ pub async fn attach_to_stream(
     Ok(stream)
 }
 
-pub async fn prewarm_internal(state: &AppState, title: &str) -> Result<(), String> {
+/*
+ * Prewarm an upstream connection by starting the stream before any subscribers connect.
+ * This reuses the UpstreamManager.run() method, so it benefits from the same
+ * cancellation token mechanism and won't conflict with regular stream requests.
+ */
+pub async fn prewarm(state: &AppState, title: &str) -> Result<(), String> {
     let url = state
         .channels
         .get(title)
@@ -95,83 +193,21 @@ pub async fn prewarm_internal(state: &AppState, title: &str) -> Result<(), Strin
         .url
         .clone();
 
-    if state.streams.contains_key(&url) {
-        return Ok(()); // Already active
+    // If already streaming this URL, nothing to do
+    if let Some(active) = state.upstream_manager.stream_url.read().await.as_deref() {
+        if active == url {
+            tracing::debug!(channel = %title, "prewarm skipped: already streaming this channel");
+            return Ok(());
+        }
     }
 
-    let (tx, _) = tokio::sync::broadcast::channel::<bytes::Bytes>(1024);
-    let tx_clone = tx.clone();
-    let state_handle = std::sync::Arc::clone(&state.streams);
-    let url_clone = url.clone();
-    let title_owned = title.to_string();
-
-    state.streams.insert(url.clone(), tx);
     tracing::info!(channel = %title, upstream_url = %url, "prewarm starting upstream connection");
 
-    let parsed_url = reqwest::Url::parse(&url).map_err(|e| e.to_string())?;
-    let request = reqwest::Request::new(reqwest::Method::GET, parsed_url);
-
-    let response = state
-        .client
-        .execute(request)
+    // Reuse the same run() method - this ensures proper cancellation handling
+    // and uses the shared broadcast sender
+    state
+        .upstream_manager
+        .run(url, true)
         .await
-        .map_err(|e| e.to_string())?;
-
-    let mut stream = futures_util::StreamExt::fuse(response.bytes_stream());
-
-    // Spawn background task to keep the stream warm until subscribers connect or timeout
-    tokio::spawn(async move {
-        let mut chunk_count = 0;
-        let prewarm_timeout = tokio::time::sleep(tokio::time::Duration::from_secs(10));
-        tokio::pin!(prewarm_timeout);
-
-        loop {
-            tokio::select! {
-                _ = &mut prewarm_timeout => {
-                    if tx_clone.receiver_count() == 0 {
-                        tracing::info!(channel = %title_owned, "prewarm timeout with no subscribers, closing");
-                        break;
-                    }
-                    // If we have subscribers, continue indefinitely (normal stream behavior)
-                }
-                chunk = tokio_stream::StreamExt::next(&mut stream) => {
-                    match chunk {
-                        Some(Ok(bytes)) => {
-                            chunk_count += 1;
-                            if chunk_count == 1 {
-                                tracing::debug!(channel = %title_owned, "prewarm first chunk received");
-                            }
-
-                            // Once subscribers connect, check if they all disconnect
-                            if tx_clone.receiver_count() == 0 && chunk_count > 20 {
-                                // Only exit if we HAD subscribers and they all left
-                                // The timeout handles the "never had subscribers" case
-                                if prewarm_timeout.is_elapsed() {
-                                    tracing::debug!(channel = %title_owned, "no more subscribers, closing prewarm");
-                                    break;
-                                }
-                            }
-
-                            if let Err(e) = tx_clone.send(bytes) {
-                                tracing::trace!(error = %e, "prewarm broadcast send failed (no receivers)");
-                            }
-                        }
-                        Some(Err(e)) => {
-                            tracing::warn!(channel = %title_owned, error = %e, "upstream stream error during prewarm");
-                            break;
-                        }
-                        None => {
-                            tracing::debug!(channel = %title_owned, "upstream stream ended");
-                            break;
-                        }
-                    }
-                }
-            }
-        }
-
-        tracing::debug!(channel = %title_owned, "prewarm connection closed");
-        state_handle.remove(&url_clone);
-    });
-
-    Ok(())
+        .map_err(|e| e.to_string())
 }

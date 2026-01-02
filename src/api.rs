@@ -1,8 +1,9 @@
 use crate::error::{ProxyError, UpstreamFetchError};
+use crate::sync::{sync_sse, sync_update, sync_delete};
 use crate::playlist::{load_playlist, serialize_playlist};
 use crate::proxy::attach_to_stream;
+use crate::sync::{is_channel_change, update_sync_state};
 use crate::state::AppState;
-use crate::sync::{self, sync_delete, sync_sse, sync_update};
 use axum::http::HeaderMap;
 use axum::{
     Router,
@@ -10,7 +11,9 @@ use axum::{
     extract::{Path, State},
     http::StatusCode,
     response::Response,
-    routing::{delete, get, post},
+    routing::get,
+    routing::post,
+    routing::delete,
 };
 use bytes::Bytes;
 use tokio::sync::broadcast;
@@ -57,7 +60,7 @@ async fn load(
         .map(|s| s.to_string())
         .unwrap_or_else(|| format!("localhost:{}", state.config.port));
 
-    let body = serialize_playlist(&state, &host); // bytes::Bytes
+    let body = serialize_playlist(&state, &host);
 
     Ok(Response::builder()
         .status(StatusCode::OK)
@@ -92,14 +95,14 @@ async fn proxy(
     let channel_url = format!("http://{}/channel/{}", host, encode(&title));
 
     // Broadcast sync state if this is a channel change
-    if sync::is_channel_change(&state, &channel_url).await {
+    if is_channel_change(&state, &channel_url).await {
         let client_id = headers
             .get("user-agent")
             .and_then(|v| v.to_str().ok())
             .unwrap_or("unknown")
             .to_string();
 
-        sync::update_sync_state(
+        update_sync_state(
             &state,
             Some(channel_url),
             Some(title.clone()),
@@ -109,7 +112,7 @@ async fn proxy(
         .await;
     }
 
-    let stream = attach_to_stream(&state, url)
+    let stream = attach_to_stream(&state, &url)
         .await
         .expect("failed to attach to stream");
 
@@ -122,4 +125,3 @@ async fn proxy(
             source: broadcast::error::SendError(Bytes::new()),
         })
 }
-

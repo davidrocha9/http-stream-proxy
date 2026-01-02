@@ -1,10 +1,11 @@
+use crate::proxy::UpstreamManager;
 use crate::state::{AppConfig, AppState};
 use crate::sync::SyncState;
 use bytes::Bytes;
 use dashmap::DashMap;
 use m3u_parser::M3uParser;
 use std::{io::Error, sync::Arc};
-use tokio::sync::{broadcast, RwLock};
+use tokio::sync::{RwLock, broadcast};
 use urlencoding::encode;
 
 // Sadly the m3u_parser crate swallows parsing errors completely
@@ -12,12 +13,14 @@ use urlencoding::encode;
 pub async fn load_playlist() -> AppState {
     let config = AppConfig::load().expect("failed to load Config");
     let url = config.clone().upstream_m3u_url;
-    
+
     // Create sync broadcast channel (capacity 16 is enough for state updates)
     let (sync_tx, _) = broadcast::channel::<SyncState>(16);
-    
+
     let channels: DashMap<String, m3u_parser::Info> = DashMap::new();
     let mut channel_order: Vec<String> = Vec::new();
+    // NOTE(caio): we can be more optimistic and consider consumers lagged starting from 32 packets
+    let (sender, _) = broadcast::channel::<Bytes>(64);
 
     let mut playlist = M3uParser::new(None);
     playlist.parse_m3u(&url, false, false).await;
@@ -30,8 +33,7 @@ pub async fn load_playlist() -> AppState {
         config,
         channels,
         channel_order: Arc::new(channel_order),
-        streams: Arc::new(DashMap::new()),
-        client: reqwest::Client::new(),
+        upstream_manager: UpstreamManager::new(sender),
         sync_state: Arc::new(RwLock::new(SyncState::default())),
         sync_tx,
     };
@@ -62,11 +64,7 @@ pub fn serialize_playlist(state: &AppState, host: &str) -> Result<bytes::Bytes, 
 
         // Proxied URL - use the requesting host so it works via Tailscale or any hostname
         // The host header already includes the port if non-standard
-        let proxied_url = format!(
-            "http://{}/channel/{}",
-            host,
-            encode(&info.title)
-        );
+        let proxied_url = format!("http://{}/channel/{}", host, encode(&info.title));
 
         out.push_str(&proxied_url);
         out.push('\n');

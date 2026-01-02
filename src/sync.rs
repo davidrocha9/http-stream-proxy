@@ -1,4 +1,4 @@
-use crate::proxy::prewarm_internal;
+use crate::proxy::prewarm;
 use crate::state::AppState;
 use axum::{
     Json,
@@ -171,18 +171,21 @@ pub async fn sync_update(
         if let Some(title) = extract_channel_title(url) {
             if let Some(channel_info) = state.channels.get(&title) {
                 let upstream_url = channel_info.url.clone();
-
-                // Only prewarm if not already active
-                if !state.streams.contains_key(&upstream_url) {
-                    tracing::info!(channel = %title, "triggering prewarm");
-                    // Fire-and-forget prewarm in background
-                    let state_clone = state.clone();
-                    let title_clone = title.clone();
-                    tokio::spawn(async move {
-                        if let Err(e) = prewarm_internal(&state_clone, &title_clone).await {
-                            tracing::warn!(channel = %title_clone, error = %e, "prewarm failed");
-                        }
-                    });
+                match state.upstream_manager.stream_url.read().await.clone() {
+                    Some(stream_url) if stream_url == upstream_url => {
+                        tracing::debug!("skipping prewarm");
+                    }
+                    _ => {
+                        tracing::info!(channel = %title, "triggering prewarm");
+                        // Fire-and-forget prewarm in background
+                        let state_clone = state.clone();
+                        let title_clone = title.clone();
+                        tokio::spawn(async move {
+                            if let Err(e) = prewarm(&state_clone, &title_clone).await {
+                                tracing::warn!(channel = %title_clone, error = %e, "prewarm failed");
+                            }
+                        });
+                    }
                 }
             }
         }

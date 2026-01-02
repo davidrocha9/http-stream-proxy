@@ -1,11 +1,11 @@
-use bytes::Bytes;
 use config::{Config, Environment, File};
 use dashmap::DashMap;
+use m3u_parser::Info;
 use serde::Deserialize;
 use std::sync::Arc;
-use tokio::sync::{broadcast, RwLock};
-use m3u_parser::Info;
+use tokio::sync::{RwLock, broadcast};
 
+use crate::proxy::UpstreamManager;
 use crate::sync::SyncState;
 
 #[derive(Debug, Deserialize, Clone)]
@@ -45,18 +45,11 @@ fn default_port() -> u16 {
 #[derive(Clone)]
 pub struct AppState {
     pub config: AppConfig,
-    // static, constructed at startup time - no shared ownership needed
     pub channels: DashMap<String, Info>, // title -> Stream info
     pub channel_order: Arc<Vec<String>>, // preserves original playlist order
-    pub streams: Arc<DashMap<String, broadcast::Sender<Bytes>>>, // URL -> Active Broadcast
-    /*
-     * we can only have ONE concurrent upstream connection at any time
-     * so let's just have one single http client that can then easily be configured
-     * e.g.: timeouts, headers, retries, etc
-     */
-    pub client: reqwest::Client,
-    
-    // Sync state for SSE broadcast to all clients
+    pub upstream_manager: UpstreamManager,
+
+    // Sync state for SSE broadcast to all clients (deprecated)
     pub sync_state: Arc<RwLock<SyncState>>,
     pub sync_tx: broadcast::Sender<SyncState>,
 }
