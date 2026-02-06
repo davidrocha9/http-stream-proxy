@@ -21,14 +21,20 @@ pub enum ProxyError {
         source: reqwest::Error,
     },
 
+    #[error("failed to start transcoder")]
+    TranscoderStart {
+        #[source]
+        source: std::io::Error,
+    },
+
     #[error("broadcast channel error")]
     DownstreamSend {
         #[source]
         source: broadcast::error::SendError<Bytes>,
     },
-    
+
     #[error("no active stream")]
-    GuestError
+    GuestError,
 }
 
 impl ProxyError {
@@ -37,8 +43,9 @@ impl ProxyError {
             ProxyError::ChannelNotFound { .. } => StatusCode::NOT_FOUND,
             ProxyError::UpstreamRequest { .. } => StatusCode::BAD_GATEWAY,
             ProxyError::UpstreamStream { .. } => StatusCode::BAD_GATEWAY,
+            ProxyError::TranscoderStart { .. } => StatusCode::BAD_GATEWAY,
             ProxyError::DownstreamSend { .. } => StatusCode::INTERNAL_SERVER_ERROR,
-            ProxyError::GuestError { .. } => StatusCode::NOT_FOUND,
+            ProxyError::GuestError => StatusCode::NOT_FOUND,
         }
     }
 }
@@ -66,7 +73,7 @@ pub enum UpstreamFetchError {
         #[source]
         source: reqwest::Error,
     },
-    
+
     #[error("failed to construct m3u response")]
     ResponseBuild {
         #[source]

@@ -19,8 +19,7 @@ pub async fn load_playlist() -> AppState {
 
     let channels: DashMap<String, m3u_parser::Info> = DashMap::new();
     let mut channel_order: Vec<String> = Vec::new();
-    // NOTE(caio): we can be more optimistic and consider consumers lagged starting from 32 packets
-    let (sender, _) = broadcast::channel::<Bytes>(64);
+    let (sender, _) = broadcast::channel::<Bytes>(config.stream_broadcast_capacity.max(64));
 
     let mut playlist = M3uParser::new(None);
     playlist.parse_m3u(&url, false, false).await;
@@ -76,16 +75,16 @@ pub fn serialize_playlist(state: &AppState, host: &str) -> Result<bytes::Bytes, 
 pub fn serialize_guest_playlist(host: &str) -> Result<bytes::Bytes, Error> {
     let mut out = String::with_capacity(128);
     out.push_str("#EXTM3U\n");
-    
+
     // EXTINF line
     out.push_str("#EXTINF:-1 ");
     out.push_str(r#"tvg-id="live" tvg-name="live" tvg-logo="" group-title="Guest",live"#);
     out.push('\n');
-    
+
     // Guest URL
     let guest_url = format!("http://{}/guest", host);
     out.push_str(&guest_url);
     out.push('\n');
-    
+
     Ok(Bytes::from(out))
 }

@@ -1,25 +1,28 @@
 use crate::auth::EmailCheck;
 use crate::error::{ProxyError, UpstreamFetchError};
 use crate::playlist::{load_playlist, serialize_guest_playlist, serialize_playlist};
-use crate::proxy::attach_to_stream;
+use crate::proxy::{attach_to_stream, prewarm as prewarm_upstream};
 use crate::state::AppState;
-use crate::sync::{is_channel_change, update_sync_state};
 use crate::sync::{sync_delete, sync_sse, sync_update};
 use axum::http::{HeaderMap, Response};
 use axum::middleware;
 use axum::{
-    Router,
+    Json, Router,
     body::Body,
     extract::{Path, State},
     http::StatusCode,
-    routing::delete,
-    routing::get,
-    routing::post,
+    routing::{delete, get, post},
 };
 use bytes::Bytes;
+use serde::Serialize;
 use tokio::sync::broadcast;
 use tower_http::cors::CorsLayer;
-use urlencoding::encode;
+
+#[derive(Serialize)]
+struct PrewarmResponse {
+    success: bool,
+    message: String,
+}
 
 pub async fn serve() {
     let app_state = load_playlist().await;
@@ -37,6 +40,7 @@ pub async fn serve() {
     let app = Router::new()
         .route("/", get(load))
         .route("/channel/{title}", get(proxy))
+        .route("/prewarm/{title}", post(prewarm_channel))
         .route_layer(middleware::from_fn(move |req, next| {
             let check = auth_layer.clone();
             check.admin_middleware(req, next)
@@ -83,24 +87,15 @@ async fn load(
         .status(StatusCode::OK)
         .header("Content-Type", "application/octet-stream")
         .header("Cache-Control", "no-cache")
-        .body(Body::from(body.unwrap())) // ← this is the only step needed
+        .body(Body::from(body.unwrap()))
         .map_err(|e| {
             tracing::error!("failed to build response: {}", e);
             UpstreamFetchError::ResponseBuild { source: e }
         })?)
 }
 
-fn get_channel_from_header(headers: &HeaderMap, channel_title: &str) -> String {
-    let host = headers
-        .get("host")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("localhost");
-    format!("http://{}/channel/{}", host, encode(channel_title))
-}
-
 async fn proxy(
     Path(title): Path<String>,
-    headers: HeaderMap,
     State(state): State<AppState>,
 ) -> Result<Response<Body>, ProxyError> {
     // get the actual upstream URL from the proxied one
@@ -113,29 +108,7 @@ async fn proxy(
         .url
         .clone();
 
-    let channel_url = get_channel_from_header(&headers, &title);
-
-    // Broadcast sync state if this is a channel change
-    if is_channel_change(&state, &channel_url).await {
-        let client_id = headers
-            .get("user-agent")
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("unknown")
-            .to_string();
-
-        update_sync_state(
-            &state,
-            Some(channel_url),
-            Some(title.clone()),
-            Some(true),
-            &client_id,
-        )
-        .await;
-    }
-
-    let stream = attach_to_stream(&state, &url)
-        .await
-        .expect("failed to attach to stream");
+    let stream = attach_to_stream(&state, &title, &url).await?;
 
     Response::builder()
         .status(StatusCode::OK)
@@ -152,16 +125,20 @@ async fn proxy(
  * i.e.: the admin controls which streams get initiated, and allows guests to attach to it
  */
 pub async fn guest(State(state): State<AppState>) -> Result<Response<Body>, ProxyError> {
-    let stream = match state.upstream_manager.stream_url.read().await.as_deref() {
-        None => Err(ProxyError::GuestError),
-        Some(url) => attach_to_stream(&state, url).await,
-    };
+    let active_title = state.upstream_manager.stream_title.read().await.clone();
+    let stream = match (
+        active_title.as_deref(),
+        state.upstream_manager.stream_url.read().await.as_deref(),
+    ) {
+        (Some(title), Some(url)) => attach_to_stream(&state, title, url).await,
+        _ => Err(ProxyError::GuestError),
+    }?;
 
     Response::builder()
         .status(StatusCode::OK)
         .header("Content-Type", "video/mp2t")
         .header("Access-Control-Allow-Origin", "*")
-        .body(Body::from_stream(stream.unwrap()))
+        .body(Body::from_stream(stream))
         .map_err(|_| ProxyError::DownstreamSend {
             source: broadcast::error::SendError(Bytes::new()),
         })
@@ -182,9 +159,24 @@ pub async fn guest_playlist(
         .status(StatusCode::OK)
         .header("Content-Type", "application/octet-stream")
         .header("Cache-Control", "no-cache")
-        .body(Body::from(body.unwrap())) // ← this is the only step needed
+        .body(Body::from(body.unwrap()))
         .map_err(|e| {
-            tracing::error!("failed to build response: {}", e);
+            tracing::error!("failed to build guest response: {}", e);
             ProxyError::GuestError
         })?)
+}
+
+async fn prewarm_channel(
+    Path(title): Path<String>,
+    State(state): State<AppState>,
+) -> Result<Json<PrewarmResponse>, StatusCode> {
+    prewarm_upstream(&state, &title).await.map_err(|e| {
+        tracing::warn!(channel = %title, error = %e, "prewarm failed");
+        StatusCode::BAD_GATEWAY
+    })?;
+
+    Ok(Json(PrewarmResponse {
+        success: true,
+        message: format!("Stream prewarmed: {}", title),
+    }))
 }

@@ -5,8 +5,45 @@
   // Port for this proxy server
   "port": 2727,
 
-  // if set to production, middlewares authorize based on tailscale credentials
+  // If set to production, middlewares authorize based on tailscale credentials
   "env": "local",
-  "admin_email": "caionogueira0626@gmail.com",
+  "admin_email": "",
   "whitelisted_emails": [],
+
+  // If true, channels that look like Full HD (Full HD / FHD / 1080)
+  // will be proxied through ffmpeg with AAC audio for browser compatibility.
+  "transcode_full_hd_audio_to_aac": true,
+
+  // If true, Full HD channels will also have video re-encoded to clean H264.
+  // This is heavier but fixes decoder issues in browser/WebView players.
+  "transcode_full_hd_video_to_h264": true,
+
+  // ffmpeg binary path (must exist in PATH or absolute path)
+  "ffmpeg_path": "ffmpeg",
+
+  // AAC bitrate used when transcoding Full HD audio
+  "ffmpeg_audio_bitrate_kbps": 128,
+
+  // x264 settings for Full HD video re-encode
+  "ffmpeg_video_preset": "veryfast",
+  "ffmpeg_video_crf": 23,
+
+  // Encoder for Full HD video re-encode:
+  // - "libx264" (software)
+  // - "h264_v4l2m2m" (Raspberry Pi hardware encoder, if available)
+  "ffmpeg_video_encoder": "libx264",
+
+  // Limit CPU/latency usage for transcoding
+  "ffmpeg_video_threads": 2,
+  "ffmpeg_video_output_fps": 25,
+  "ffmpeg_video_maxrate_kbps": 4500,
+  "ffmpeg_video_bufsize_kbps": 2250,
+
+  // Broadcast / buffering behavior
+  "stream_broadcast_capacity": 512,
+  "transcoded_read_chunk_bytes": 32768,
+
+  // Prewarm tuning
+  "prewarm_keepalive_secs": 8,
+  "prewarm_transcoded_streams": false
 }
